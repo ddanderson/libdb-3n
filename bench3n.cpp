@@ -9,6 +9,19 @@
  * non-infringement, are disclaimed.
  */
 
+// This code 'mostly' implements the '3n+1 NoSQL/Key-Value/Schema-Free/
+// Schema-Less Database Benchmark' described here:
+//   https://docs.google.com/View?id=dd5f3337_12fzjpqbc2
+// At the moment, we don't honor the benchmark's input/output
+// requirements (reading config values on stdin, all the things
+// we need to report on output)
+//
+// Note: this code could be refactored a bit, and better error
+// handling added.  I actually removed some layers, and moved
+// everything into just two files so that small portions could be
+// examined on their own, for the purposes of illustration, and for
+// verification of the benchmark.
+
 #include "db.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,29 +29,52 @@
 #include <string>
 #include <iostream>
 #include <sstream>
+#include <algorithm>
 #include "bench3n.h"
 
-#define STORE_AS_STRING
-
+// std::string used 
 using namespace std;
 
-const int compute_chunk_size = 1000;
-
-const char *testdir = NULL;
-
-static DB_ENV *curdbenv;
-static volatile int running = 1;
+// Do the 'enhanced' benchmark - all values stored as strings
+#define STORE_AS_STRING  1
 
 typedef int cyclelength_t;
+typedef long maxvalue_t;
+
+// more like a struct - we allow free access to all
+class Results {
+public:
+    Results() : cyclelength(-1), maxvalue(-1L) { }
+    cyclelength_t cyclelength;
+    maxvalue_t maxvalue;
+
+};
 
 enum TxnType {
     SYNC, NOSYNC, WRITENOSYNC, NONE
 };
 
-// These are arguments - input and output, past to each worker thread
+// Each thread evaluates a chunk of values of N.
+// For example, the first thread in evaluates the first 1000 values,
+// The next thread the next 1000, etc.  Doing in chunks at a time
+// removes a point of contention.
+const int compute_chunk_size = 1000;
+const char *testdir = NULL;
+
+// Used by trickle thead to know when to quit
+static volatile int running = 1;
+
+// The next_value and the associated mutex is used by the
+// 'chunk allocator'
+static long next_value = -1;
+mutex_handle get_value_mutex;
+
+// These are arguments - input and output, passed to each worker thread
 struct bench_args {
     // these are input args, only read by the thread
+    DB_ENV *dbenv;
     DB *benchdb;
+    DB *resultdb;
     int minn;
     int maxn;
     int threads;
@@ -52,11 +88,11 @@ struct bench_args {
     bool sortbylength;
 
     // these are output or 'return' args, only written by the thread
-    cyclelength_t ret_cycles;
     long ret_nput;
     long ret_nget;
 };
 
+// Used by the 'enhanced' benchmark
 const char *digits[] =
 {
     "zero", "eins", "deux",
@@ -68,7 +104,7 @@ static void dump_digits()
 {
     for (int i=0; i<10; i++)
     {
-        //fprintf(stderr, "digit[%d] len=%d \"%s\"\n", i, (int)strlen(digits[i]), digits[i]);
+        fprintf(stderr, "digit[%d] len=%d \"%s\"\n", i, (int)strlen(digits[i]), digits[i]);
     }
 }
 
@@ -138,7 +174,8 @@ u_int32_t partitioner(DB *db, DBT *key)
 }
 
 
-// Forces values to be stored in MSB format
+// Forces values to be stored in MSB format - that's important for locality
+// This class is used by the unenhanced benchmark
 class DatabaseLong
 {
 private:
@@ -180,10 +217,12 @@ public:
     }
 };
 
+// This class is used by the enhanced benchmark
 class DatabaseDigits
 {
 private:
     string s;
+
 public:
     DatabaseDigits(long l)
     {
@@ -193,6 +232,12 @@ public:
     DatabaseDigits(string &sparam)
     {
         s = sparam;
+    }
+
+    DatabaseDigits(DBT *dbt)
+    {
+        string str((char *)dbt->data, dbt->size);
+        s = str;
     }
 
     long getLong()
@@ -219,9 +264,8 @@ public:
     {
         if (l < 10) {
             if (l < 0) {
-                // ERROR!!
                 cerr << "bad call to setLong(" << l << ")\n";
-                exit(1);
+                exit(1);                // TODO: throw exception
             }
             s = digits[(int)l];
         }
@@ -248,20 +292,86 @@ public:
 
 };
 
-std::string db_path_name(const char *name)
+void init_dbt(DBT *dbt, const void *data, size_t size)
 {
-    if (curdbenv == NULL) {
-        return std::string(testdir) + "/" + name;
+    memset(dbt, 0, sizeof(DBT));
+    if (data != 0) {
+        dbt->data = (void *)data;
+        // for some APIs (get) we'll need size set,
+        // for some (put), we need ulen set.
+        // By setting both, this method can be used in either case.
+        dbt->size = size;
+        dbt->ulen = size;
     }
-    else {
-        return name;
+    dbt->flags = DB_DBT_USERMEM;
+}
+
+Results get_result(bench_args *args)
+{
+    DBT keydbt;
+    DBT valdbt;
+    int ret;
+    Results result;
+
+    init_dbt(&valdbt, &result, sizeof(result));
+    init_dbt(&keydbt, "", 0);
+
+    DEADLOCK_RETRY(args->resultdb->get(args->resultdb, NULL, &keydbt, &valdbt, DB_READ_UNCOMMITTED), 5, "db", "get", ret);
+    if (ret != 0 && ret != DB_NOTFOUND) {
+        fprintf(stderr, "bench3n: error: getting result: %s\n", db_strerror(ret));
+        exit(1);                  // TODO: throw exception
+    }
+
+    return result;
+}
+
+void update_result(bench_args *args, Results result)
+{
+    DB_TXN *txn;
+    DBT keydbt;
+    DBT valdbt;
+    int ret;
+    Results curresult;
+
+    init_dbt(&keydbt, "", 0);
+
+    int deadtries = 0;
+    while (deadtries++ < 5) {
+
+        init_dbt(&valdbt, &curresult, sizeof(curresult));
+
+        // Always sync changes to results.
+        CHK(args->dbenv->txn_begin(args->dbenv, NULL, &txn, DB_TXN_SYNC), "DB_ENV", "txn_begin");
+
+        // since we're in a loop, reinitialize curresult.
+        curresult.cyclelength = -1;
+        curresult.maxvalue = -1;
+        if ((ret = (args->resultdb->get(args->resultdb, txn, &keydbt, &valdbt, DB_RMW))) == 0
+          || ret == DB_NOTFOUND) {
+
+            if (curresult.cyclelength >= result.cyclelength && curresult.maxvalue >= result.maxvalue) {
+                // no changes needed, we're done.
+                CHK(txn->commit(txn, 0), "txn", "commit");
+                break;
+            }
+            curresult.cyclelength = max(curresult.cyclelength, result.cyclelength);
+            curresult.maxvalue = max(curresult.maxvalue, result.maxvalue);
+
+            if ((ret = (args->resultdb->put(args->resultdb, txn, &keydbt, &valdbt, 0))) == 0) {
+                // changed, we're done.
+                CHK(txn->commit(txn, 0), "txn", "commit");
+                break;
+            }
+        }
+        if (ret != DB_LOCK_DEADLOCK) {
+            fprintf(stderr, "bench3n: error: updating result: %s\n", db_strerror(ret));
+            exit(1);                  // TODO: throw exception
+        }
+        CHK(txn->abort(txn), "txn", "abort");
     }
 }
 
-static long next_value = -1;
-
-mutex_handle get_value_mutex;
-
+// Get the start of the next 'chunk' of values to evaluate
 long get_next_value()
 {
     long retval = 0;
@@ -276,19 +386,26 @@ long get_next_value()
     return retval;
 }
 
-cyclelength_t compute_cycles(bench_args *args, long n)
+Results compute_cycles(bench_args *args, long n, long maxseen)
 {
+    if (n >= maxseen) {
+        maxseen = n;
+    }
+    Results result;
+    result.maxvalue = maxseen;
+
     if (n == 1) {
-        return 1;
+        result.cyclelength = 1;
+        return result;
     }
     if (n <= 0) {
         fprintf(stderr, "bench3n: overflow/underflow\n");
-        return -1;                  // TODO: throw exception
+        exit(1);                  // TODO: throw exception
     }
 
-#ifdef STORE_AS_STRING
+#if STORE_AS_STRING
     DatabaseDigits key(n);
-    DatabaseDigits val(0);
+    DatabaseDigits val(0L);
     char stored[512];          // TODO: should avoid fixed size array.
 #else
     DatabaseLong key(n);
@@ -296,21 +413,15 @@ cyclelength_t compute_cycles(bench_args *args, long n)
 #endif
 
     DBT keydbt;
-    memset(&keydbt, 0, sizeof(DBT));
-    keydbt.data = key.getBytes();
-    keydbt.size = keydbt.ulen = key.getSize();
-    keydbt.flags = DB_DBT_USERMEM;
-
     DBT valdbt;
-    memset(&valdbt, 0, sizeof(DBT));
-#ifdef STORE_AS_STRING
-    valdbt.data = stored;
-    valdbt.size = valdbt.ulen = sizeof(stored);
+
+    init_dbt(&keydbt, key.getBytes(), key.getSize());
+
+#if STORE_AS_STRING
+    init_dbt(&valdbt, stored, sizeof(stored));
 #else
-    valdbt.data = &val;
-    valdbt.size = valdbt.ulen = sizeof(cyclelength_t);
+    init_dbt(&valdbt, &val, sizeof(val));
 #endif
-    valdbt.flags = DB_DBT_USERMEM;
 
     int ret;
     int flags = 0;
@@ -319,15 +430,14 @@ cyclelength_t compute_cycles(bench_args *args, long n)
     DEADLOCK_RETRY(args->benchdb->get(args->benchdb, NULL, &keydbt, &valdbt, flags), 5, "db", "get", ret);
     if (ret == 0)
     {
-#ifdef STORE_AS_STRING
-        stored[valdbt.size] = '\0';
-        string ds(stored);
-        DatabaseDigits d(ds);
-        return d.getLong();
+#if STORE_AS_STRING
+        DatabaseDigits d(&valdbt);
+        result.cyclelength = d.getLong();
 #else
         /*fprintf(stderr, "  found (%d) => %d\n", n, val);*/
-        return val;
+        result.cyclelength = val;
 #endif
+        return result;
     }
     else if (ret != DB_NOTFOUND)
     {
@@ -336,42 +446,42 @@ cyclelength_t compute_cycles(bench_args *args, long n)
     }
 
     long nextn = ((n % 2) == 0) ? (n/2) : (3*n + 1);
-    cyclelength_t ncycles = compute_cycles(args, nextn);
-    if (ncycles <= 0)
-        return ncycles;             // error return
-    ncycles++;
+    result = compute_cycles(args, nextn, maxseen);
+    if (result.cyclelength <= 0)
+        return result;             // error return
+    result.cyclelength++;
 
-#ifdef STORE_AS_STRING
-    DatabaseDigits d(ncycles);
-    valdbt.data = d.getBytes();
-    valdbt.size = valdbt.ulen = d.getSize();
+#if STORE_AS_STRING
+    DatabaseDigits d(result.cyclelength);
+    init_dbt(&valdbt, d.getBytes(), d.getSize());
 #else
-    val = ncycles;
+    val = result.cyclelength;
 #endif
     args->ret_nput++;
     DEADLOCK_RETRY(args->benchdb->put(args->benchdb, NULL, &keydbt, &valdbt, 0), 5, "db", "put", ret);
-    if (ret == 0)
-        return ncycles;
-    else
+    if (ret != 0)
     {
         fprintf(stderr, "bench3n: error: getting value %ld: %s\n", key.getLong(), db_strerror(ret));
-        return -1;                  // TODO: throw exception
+        exit(-1);                  // TODO: throw exception
     }
+    return result;
 }
 
 void *bench_thread_main(void *thread_args)
 {
     bench_args *args = (bench_args*)thread_args;
-    cyclelength_t maxcycles = -1;
     for (long chunkstart = get_next_value(); chunkstart <= args->maxn; chunkstart = get_next_value()) {
         for (long n = chunkstart; n < chunkstart + compute_chunk_size; n++) {
-            cyclelength_t ncycles = compute_cycles(args, n);
-            if (ncycles > maxcycles)
-                maxcycles = ncycles;
+            Results results = compute_cycles(args, n, -1L);
+            // Update_result (especially when everyone is doing it) is expensive,
+            // so first peek at the results to see if we might need to update.
+            Results curresult = get_result(args);
+            if (curresult.cyclelength < results.cyclelength ||
+              curresult.maxvalue < results.maxvalue) {
+                update_result(args, results);
+            }
         }
     }
-    //fprintf(stderr, "thread result: %d: %d\n", args->maxn, maxcycles);
-    args->ret_cycles = maxcycles;
     return NULL;
 }
 
@@ -385,7 +495,7 @@ void *trickle_thread_main(void *thread_args)
     while (running) {
         if (args->tricklepercent < 0) {
             int npages = 0;
-            curdbenv->memp_trickle(curdbenv, pct, &npages);
+            args->dbenv->memp_trickle(args->dbenv, pct, &npages);
             if (npages > 0) {
                 nsecs = 7;
                 if (pct > 3)
@@ -400,7 +510,7 @@ void *trickle_thread_main(void *thread_args)
             }
         }
         else {
-            curdbenv->memp_trickle(curdbenv, args->tricklepercent, NULL);
+            args->dbenv->memp_trickle(args->dbenv, args->tricklepercent, NULL);
         }
         sleep(nsecs);
     }
@@ -413,7 +523,7 @@ void runbench(bench_args *args)
     bench_args targs[args->threads];
     int nthreads = args->threads;
     int ret;
-    cyclelength_t maxcycles = 0;
+    Results result;
     long nput = 0;
     long nget = 0;
 
@@ -438,53 +548,57 @@ void runbench(bench_args *args)
     time(&endt);
     nseconds = (int)(endt - startt);
 
-    // collect the results
+    // collect the per-thread statistics
     for (int t=0; t<nthreads; t++) {
-        if (targs[t].ret_cycles > maxcycles)
-            maxcycles = targs[t].ret_cycles;
         nput += targs[t].ret_nput;
         nget += targs[t].ret_nget;
     }
-    fprintf(stderr, "  N=%d\n  result=%d\n  time=%d\n", args->maxn, maxcycles, nseconds);
+    result = get_result(args);
+
+    fprintf(stderr, "  N=%d\n  result=%d\n  maxvalue=%ld\n  time=%d\n", args->maxn, result.cyclelength, result.maxvalue, nseconds);
     fprintf(stderr, "  nputs=%ld (%.2f puts/second)\n  ngets=%ld (%.2f gets/second)\n  ops=%ld (%.2f ops/second)\n\n", nput, ((double)nput)/nseconds, nget, ((double)nget)/nseconds, (nput+nget), ((double)(nput+nget)/nseconds));
 }
 
 int openrunbench(bench_args *args)
 {
+    DB_ENV *env;
     DB *db;
     int envflags;
 
+    // Set up environment configured according to input parameters
     envflags = DB_CREATE | DB_INIT_MPOOL | DB_INIT_LOCK | DB_THREAD;
-    CHK(db_env_create(&curdbenv, 0), "dbenv", "create");
+    CHK(db_env_create(&env, 0), "dbenv", "create");
     if (args->cachek != 0) {
-        CHK(curdbenv->set_cachesize(curdbenv, 0, args->cachek * 1024, 0), "dbenv", "set_cachesize");
+        CHK(env->set_cachesize(env, 0, args->cachek * 1024, 0), "dbenv", "set_cachesize");
     }
-    CHK(curdbenv->set_lk_detect(curdbenv, DB_LOCK_DEFAULT), "dbenv", "set_lk_detect");
+    CHK(env->set_lk_detect(env, DB_LOCK_DEFAULT), "dbenv", "set_lk_detect");
     if (args->logbufsizek != 0) {
-        CHK(curdbenv->set_lg_bsize(curdbenv, args->logbufsizek * 1024), "dbenv", "set_lg_bufsize");
+        CHK(env->set_lg_bsize(env, args->logbufsizek * 1024), "dbenv", "set_lg_bufsize");
     }
     if (args->logflags != 0) {
-        CHK(curdbenv->log_set_config(curdbenv, args->logflags, 1), "dbenv", "log_set_config");
+        CHK(env->log_set_config(env, args->logflags, 1), "dbenv", "log_set_config");
     }
     if (args->txn != NONE) {
         envflags |= DB_INIT_TXN;
         if (args->txn == NOSYNC) {
-            CHK(curdbenv->set_flags(curdbenv, DB_TXN_NOSYNC, 1), "dbenv", "set_flags");
+            CHK(env->set_flags(env, DB_TXN_NOSYNC, 1), "dbenv", "set_flags");
         }
-        else if (args->txn == NOSYNC) {
-            CHK(curdbenv->set_flags(curdbenv, DB_TXN_WRITE_NOSYNC, 1), "dbenv", "set_flags");
+        else if (args->txn == WRITENOSYNC) {
+            CHK(env->set_flags(env, DB_TXN_WRITE_NOSYNC, 1), "dbenv", "set_flags");
         }
     }
-    CHK(curdbenv->open(curdbenv, testdir, envflags, 0), "dbenv->open", testdir);
-    
-    std::string pathnm = db_path_name("3ncycles.db");
+    CHK(env->open(env, testdir, envflags, 0), "dbenv->open", testdir);
+    args->dbenv = env;
+
+    // Set up cycles database, contains intermediate results.
+    const char *pathnm = "3ncycles.db";
     int flags = DB_CREATE;
     if (args->txn != NONE) {
         flags |= DB_AUTO_COMMIT;
     }
     flags |= DB_READ_UNCOMMITTED;
 
-    CHK(db_create(&db, curdbenv, 0), "db", "create");
+    CHK(db_create(&db, env, 0), "db", "create");
     db->app_private = args;
     if (args->sortbylength) {
         CHK(db->set_bt_compare(db, key_digit_length_compare), "db", "set compare");
@@ -492,22 +606,34 @@ int openrunbench(bench_args *args)
     if (args->partition > 0) {
         CHK(db->set_partition(db, args->partition, NULL, partitioner), "db", "set_partition");
     }
-    CHK(db->open(db, NULL, pathnm.c_str(), NULL, DB_BTREE, flags, 0), "db->open", pathnm.c_str());
-
+    CHK(db->open(db, NULL, pathnm, NULL, DB_BTREE, flags, 0), "db->open", pathnm);
     args->benchdb = db;
 
+    // Set up result database
+    pathnm = "3nresult.db";
+    flags = DB_CREATE | DB_AUTO_COMMIT;
+    CHK(db_create(&db, env, 0), "db", "create");
+    db->app_private = args;
+    CHK(db->open(db, NULL, pathnm, NULL, DB_BTREE, flags, 0), "db->open", pathnm);
+    args->resultdb = db;
+
+    // Set up trickle thread if specified
     thread_handle trickle_thread;
     if (args->tricklepercent != 0) {
         CHK(thread_start(trickle_thread_main, args, &trickle_thread), "dbenv", "tricklethread");
     }
 
+    // Run the benchmark
     runbench(args);
+
+    // Clean up: close and wait for any additional threads.
     CHK(args->benchdb->close(args->benchdb, 0), "db", "close");
+    CHK(args->resultdb->close(args->resultdb, 0), "db", "close");
     running = 0;
     if (args->tricklepercent != 0) {
         CHK(thread_join(trickle_thread), "trickle thread", "join");
     }
-    CHK(curdbenv->close(curdbenv, 0), "dbenv", "close");
+    CHK(env->close(env, 0), "dbenv", "close");
 
     return (0);
 }
@@ -617,7 +743,7 @@ int main(int argc, char **argv) {
     }
     testdir = argv[1];
 
-    dump_digits();
+    //dump_digits();
     mutex_init(&get_value_mutex);
     return openrunbench(&args);
 }

@@ -10,11 +10,13 @@
  */
 
 #include <pthread.h>
+#include <time.h>
 typedef pthread_t thread_handle;
 typedef pthread_mutex_t mutex_handle;
 #define	mutex_init(mhandle)	pthread_mutex_init(mhandle, NULL)
 #define	mutex_lock(mhandle)	pthread_mutex_lock(mhandle)
 #define	mutex_unlock(mhandle)	pthread_mutex_unlock(mhandle)
+#define thread_sleep(millis)
 
 
 char *PROGRAM_NAME = (char *)"bench3n";
@@ -40,7 +42,10 @@ static void errexit(int ret, const char *who, const char *what) {
             /*fprintf(stderr, "  %s ==> ", #call);*/                  \
             if ((ret = (call)) != DB_LOCK_DEADLOCK)                   \
                 break;                                                \
-            sleep(1);                                                 \
+            struct timespec ts;                                       \
+            ts.tv_sec = 0;                                            \
+            ts.tv_nsec = 1000 << deadtries;                           \
+            nanosleep(&ts, NULL);                                     \
         }                                                             \
         /*fprintf(stderr, "%d\n", ret);*/                             \
     } while(0)
